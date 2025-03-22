@@ -72,6 +72,30 @@ def mape_metric(y_true, y_pred):
     return np.mean(np.abs((y_true_non_zero - y_pred_non_zero) / y_true_non_zero)) * 100
 
 
+def process_data(df: pd.DataFrame, description: str) -> pd.DataFrame:
+    """Proceso de transformación para preparar los datos para Prophet."""
+    # Paso 1: Obtener todas las columnas que están después de la columna 'DESCRIPCION'
+    columns_after_description = df.columns[df.columns.get_loc('DESCRIPCION') + 1:]
+
+    # Paso 2: Aplicar melt solo a las columnas relevantes
+    df_melted = df.melt(id_vars=["DESCRIPCION"], value_vars=columns_after_description, var_name="Fecha",
+                        value_name="Valor")
+
+    # Paso 3: Convertir la columna 'Fecha' a tipo datetime
+    df_melted["Fecha"] = pd.to_datetime(df_melted["Fecha"], format="%m-%Y")
+
+    # Paso 4: Filtrar los datos según la descripción proporcionada
+    df_filtered = df_melted[df_melted["DESCRIPCION"] == description].copy()
+
+    # Paso 5: Seleccionar solo las columnas 'Fecha' y 'Valor' y renombrarlas
+    df_filtered = df_filtered[["Fecha", "Valor"]].rename(columns={"Fecha": "ds", "Valor": "y"})
+
+    if df_filtered.empty:
+        raise HTTPException(status_code=404, detail="Descripción no encontrada en los datos.")
+
+    return df_filtered
+
+
 # ---------------------------
 # Funciones para cacheo
 # ---------------------------
@@ -174,14 +198,10 @@ def predict(request: PredictRequest):
     periods = request.periods
 
     df = get_excel_file_from_s3(folder_name, file_name)
-    # Transformar la data
-    df_melted = df.melt(id_vars=["DESCRIPCION"], var_name="Fecha", value_name="Valor")
-    df_melted["Fecha"] = pd.to_datetime(df_melted["Fecha"], format="%m-%Y")
-    df_filtered = df_melted[df_melted["DESCRIPCION"] == description].copy()
-    df_filtered = df_filtered[["Fecha", "Valor"]].rename(columns={"Fecha": "ds", "Valor": "y"})
 
-    if df_filtered.empty:
-        raise HTTPException(status_code=404, detail="Descripción no encontrada en los datos.")
+    # Transformar la data
+
+    df_filtered = process_data(df, description)
 
     # Calcular hash de la data histórica
     data_hash = compute_data_hash(df_filtered)
@@ -227,22 +247,17 @@ def evaluate_model(request: PredictRequest):
     description = request.description
 
     df = get_excel_file_from_s3(folder_name, file_name)
-    df_melted = df.melt(id_vars=["DESCRIPCION"], var_name="Fecha", value_name="Valor")
-    df_melted["Fecha"] = pd.to_datetime(df_melted["Fecha"], format="%m-%Y")
-    df_med = df_melted[df_melted["DESCRIPCION"] == description].copy()
-    df_med = df_med[["Fecha", "Valor"]].rename(columns={"Fecha": "ds", "Valor": "y"})
 
-    if df_med.empty:
-        raise HTTPException(status_code=404, detail="Descripción no encontrada en los datos.")
+    df_filtered = process_data(df, description)
 
-    data_hash = compute_data_hash(df_med)
+    data_hash = compute_data_hash(df_filtered)
     cached = get_cached_result(description, data_hash)
 
     if cached is not None:
         hyperparams = cached
         print(f"Usando hiperparámetros cacheados para {description}")
     else:
-        hyperparams = compute_hyperparameters(df_med, description)
+        hyperparams = compute_hyperparameters(df_filtered, description)
         update_cache(hyperparams)
         print(f"Se han calculado y guardado nuevos hiperparámetros para {description}")
 
@@ -253,13 +268,13 @@ def evaluate_model(request: PredictRequest):
         weekly_seasonality=True,
         seasonality_mode='additive'
     )
-    model.fit(df_med)
+    model.fit(df_filtered)
 
     # Cálculo de métricas de validación (se recalculan en cada consulta)
-    train_forecast = model.predict(df_med)
-    rmse_train = np.sqrt(mean_squared_error(df_med['y'], train_forecast['yhat']))
-    mae_train = mean_absolute_error(df_med['y'], train_forecast['yhat'])
-    mape_train = mape_metric(df_med['y'], train_forecast['yhat'])
+    train_forecast = model.predict(df_filtered)
+    rmse_train = np.sqrt(mean_squared_error(df_filtered['y'], train_forecast['yhat']))
+    mae_train = mean_absolute_error(df_filtered['y'], train_forecast['yhat'])
+    mape_train = mape_metric(df_filtered['y'], train_forecast['yhat'])
 
     df_cv = cross_validation(
         model,
@@ -274,8 +289,8 @@ def evaluate_model(request: PredictRequest):
     cv_mape = df_p['mape'].mean() if 'mape' in df_p.columns else np.nan
 
     # Cálculo de métricas para el modelo Naive (benchmark)
-    naive_predictions = df_med['y'].shift(1).dropna()
-    real_values_naive = df_med['y'].iloc[1:]
+    naive_predictions = df_filtered['y'].shift(1).dropna()
+    real_values_naive = df_filtered['y'].iloc[1:]
     naive_rmse = np.sqrt(mean_squared_error(real_values_naive, naive_predictions))
     naive_mae = mean_absolute_error(real_values_naive, naive_predictions)
     naive_mape = mape_metric(real_values_naive, naive_predictions)
@@ -317,6 +332,8 @@ class CorrelationRequest(BaseModel):
 
 
 def clean_and_convert_columns(df):
+    # Se crea una copia para evitar el SettingWithCopyWarning
+    df = df.copy()
     numeric_columns = df.columns
     for col in numeric_columns:
         df[col] = df[col].astype(str)
@@ -330,6 +347,10 @@ def clean_and_convert_columns(df):
 def get_top_correlated_medications(medication_name, corr_matrix, top_n=5):
     try:
         medication_correlations = corr_matrix[medication_name]
+        # Si se obtiene un DataFrame (por duplicidad), se extrae la primera columna
+        if isinstance(medication_correlations, pd.DataFrame):
+            medication_correlations = medication_correlations.iloc[:, 0]
+        # Excluir la correlación consigo mismo
         medication_correlations = medication_correlations.drop(labels=[medication_name])
         sorted_correlations = medication_correlations.abs().sort_values(ascending=False)
         top_medications = sorted_correlations.head(top_n)
@@ -337,8 +358,8 @@ def get_top_correlated_medications(medication_name, corr_matrix, top_n=5):
         for med in top_medications.index:
             corr_value = medication_correlations[med]
             result.append({
-                "medication": med,
-                "correlation": corr_value
+                "medication": str(med),
+                "correlation": float(corr_value)
             })
         return result
     except KeyError:
@@ -357,13 +378,23 @@ def top_correlated(request: CorrelationRequest):
     if 'DESCRIPCION' not in df.columns:
         raise HTTPException(status_code=400, detail="La columna 'DESCRIPCION' no se encontró en los datos.")
 
-    df.set_index('DESCRIPCION', inplace=True)
-    df = clean_and_convert_columns(df)
+    # Seleccionar la columna DESCRIPCION y todas las columnas a su derecha
+    columns_after_description = df.columns[df.columns.get_loc('DESCRIPCION') + 1:]
+    df_filtered = df[['DESCRIPCION'] + list(columns_after_description)]
 
-    if description not in df.index:
+    # Agrupar por DESCRIPCION para asegurarnos que cada medicamento aparezca una única vez.
+    # Puedes elegir 'first' o 'mean', según convenga.
+    df_filtered = df_filtered.groupby('DESCRIPCION').first().reset_index()
+
+    # Establecer DESCRIPCION como índice y limpiar datos
+    df_filtered.set_index('DESCRIPCION', inplace=True)
+    df_filtered = clean_and_convert_columns(df_filtered)
+
+    if description not in df_filtered.index:
         raise HTTPException(status_code=404, detail="Descripción no encontrada en los datos.")
 
-    df_transposed = df.transpose()
+    # Transponer para que cada fila (fecha/histórico) sea una observación y cada medicamento una variable
+    df_transposed = df_filtered.transpose()
     corr_matrix = df_transposed.corr()
 
     if description not in corr_matrix.columns:
