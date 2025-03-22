@@ -133,6 +133,34 @@ def rolling_forecast_cv_xgb(X, y, initial, horizon=1, step=1):
     return np.mean(rmse_list), np.mean(mae_list), np.mean(mape_list)
 
 
+
+def process_data(df: pd.DataFrame, description: str) -> pd.DataFrame:
+    """Proceso de transformación para preparar los datos para Prophet."""
+    # Paso 1: Obtener todas las columnas que están después de la columna 'DESCRIPCION'
+    columns_after_description = df.columns[df.columns.get_loc('DESCRIPCION') + 1:]
+
+    # Paso 2: Aplicar melt solo a las columnas relevantes
+    df_melted = df.melt(id_vars=["DESCRIPCION"], value_vars=columns_after_description, var_name="Fecha",
+                        value_name="Valor")
+
+    # Paso 3: Convertir la columna 'Fecha' a tipo datetime
+    df_melted["Fecha"] = pd.to_datetime(df_melted["Fecha"], format="%m-%Y")
+
+    # Paso 4: Filtrar los datos según la descripción proporcionada
+    df_filtered = df_melted[df_melted["DESCRIPCION"] == description].copy()
+
+    # Paso 5: Seleccionar solo las columnas 'Fecha' y 'Valor' y renombrarlas
+    df_filtered = df_filtered[["Fecha", "Valor"]].rename(columns={"Fecha": "ds", "Valor": "y"})
+
+    if df_filtered.empty:
+        raise HTTPException(status_code=404, detail="Descripción no encontrada en los datos.")
+
+    return df_filtered
+
+
+
+
+
 @app.post("/predict")
 def predict(request: PredictRequest):
     folder_name = request.folder_name
@@ -142,12 +170,10 @@ def predict(request: PredictRequest):
 
     # Obtener y transformar los datos
     df = get_excel_file_from_s3(folder_name, file_name)
-    df_melted = df.melt(id_vars=["DESCRIPCION"], var_name="Fecha", value_name="Valor")
-    df_melted["Fecha"] = pd.to_datetime(df_melted["Fecha"], format="%m-%Y")
-    df_filtered = df_melted[df_melted["DESCRIPCION"] == description].copy()
-    if df_filtered.empty:
-        raise HTTPException(status_code=404, detail="Descripción no encontrada en los datos.")
-    df_filtered = df_filtered[["Fecha", "Valor"]].rename(columns={"Fecha": "ds", "Valor": "y"})
+
+    df_filtered = process_data(df, description)
+
+
 
     # Crear variables temporales para XGBoost
     df_filtered['month'] = df_filtered['ds'].dt.month
@@ -214,12 +240,9 @@ def evaluate_model(request: PredictRequest):
 
     # Preparar y transformar los datos
     df = get_excel_file_from_s3(folder_name, file_name)
-    df_melted = df.melt(id_vars=["DESCRIPCION"], var_name="Fecha", value_name="Valor")
-    df_melted["Fecha"] = pd.to_datetime(df_melted["Fecha"], format="%m-%Y")
-    df_filtered = df_melted[df_melted["DESCRIPCION"] == description].copy()
-    if df_filtered.empty:
-        raise HTTPException(status_code=404, detail="Descripción no encontrada en los datos.")
-    df_filtered = df_filtered[["Fecha", "Valor"]].rename(columns={"Fecha": "ds", "Valor": "y"})
+
+
+    df_filtered = process_data(df, description)
 
     # Crear variables para el modelo
     df_filtered['month'] = df_filtered['ds'].dt.month
@@ -295,15 +318,31 @@ def top_correlated(request: CorrelationRequest):
     df = get_excel_file_from_s3(folder_name, file_name)
     if 'DESCRIPCION' not in df.columns:
         raise HTTPException(status_code=400, detail="La columna 'DESCRIPCION' no se encontró en los datos.")
-    df.set_index('DESCRIPCION', inplace=True)
-    df = clean_and_convert_columns(df)
-    if description not in df.index:
+
+    # Seleccionar la columna DESCRIPCION y todas las columnas a su derecha
+    columns_after_description = df.columns[df.columns.get_loc('DESCRIPCION') + 1:]
+    df_filtered = df[['DESCRIPCION'] + list(columns_after_description)]
+
+    # Agrupar por DESCRIPCION para asegurarnos que cada medicamento aparezca una única vez.
+    # Puedes elegir 'first' o 'mean', según convenga.
+    df_filtered = df_filtered.groupby('DESCRIPCION').first().reset_index()
+
+    # Establecer DESCRIPCION como índice y limpiar datos
+    df_filtered.set_index('DESCRIPCION', inplace=True)
+    df_filtered = clean_and_convert_columns(df_filtered)
+
+    if description not in df_filtered.index:
         raise HTTPException(status_code=404, detail="Descripción no encontrada en los datos.")
-    df_transposed = df.transpose()
+
+    # Transponer para que cada fila (fecha/histórico) sea una observación y cada medicamento una variable
+    df_transposed = df_filtered.transpose()
     corr_matrix = df_transposed.corr()
+
     if description not in corr_matrix.columns:
         raise HTTPException(status_code=404, detail="Descripción no encontrada en la matriz de correlación.")
+
     top_medications = get_top_correlated_medications(description, corr_matrix, top_n)
+
     return {
         "description": description,
         "top_correlated_medications": top_medications
