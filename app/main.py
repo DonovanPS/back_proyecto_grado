@@ -144,6 +144,13 @@ def predict(request: PredictRequest):
     periods = request.periods
 
     df = get_excel_file_from_s3(folder_name, file_name)
+
+    # Verificar que la columna 'DESCRIPCION' exista y tomar desde esa columna en adelante
+    if "DESCRIPCION" not in df.columns:
+        raise HTTPException(status_code=400, detail="La columna 'DESCRIPCION' no se encontró en los datos.")
+    col_index = df.columns.get_loc("DESCRIPCION")
+    df = df.iloc[:, col_index:]  # Toma la columna DESCRIPCION y todas las columnas a su derecha
+
     df_melted = df.melt(id_vars=["DESCRIPCION"], var_name="Fecha", value_name="Valor")
     df_melted["Fecha"] = pd.to_datetime(df_melted["Fecha"], format="%m-%Y")
     df_filtered = df_melted[df_melted["DESCRIPCION"] == description].copy()
@@ -190,6 +197,13 @@ def evaluate_model(request: PredictRequest):
     description = request.description
 
     df = get_excel_file_from_s3(folder_name, file_name)
+
+    # Asegurarse de que se seleccione la columna "DESCRIPCION" y las que le siguen
+    if "DESCRIPCION" not in df.columns:
+        raise HTTPException(status_code=400, detail="La columna 'DESCRIPCION' no se encontró en los datos.")
+    col_index = df.columns.get_loc("DESCRIPCION")
+    df = df.iloc[:, col_index:]
+
     df_melted = df.melt(id_vars=["DESCRIPCION"], var_name="Fecha", value_name="Valor")
     df_melted["Fecha"] = pd.to_datetime(df_melted["Fecha"], format="%m-%Y")
     df_med = df_melted[df_melted["DESCRIPCION"] == description].copy()
@@ -219,8 +233,9 @@ def evaluate_model(request: PredictRequest):
         raise HTTPException(status_code=500, detail=f"Error al ajustar el modelo SARIMAX: {str(e)}")
 
     # Predicciones in-sample (predicción uno a uno en todo el histórico)
-    in_sample_pred = sarima_model.get_prediction(start=series.index[0], end=series.index[-1], dynamic=False)
-    pred_mean = in_sample_pred.predicted_mean
+    in_sample_pred = sarima_model.get_prediction(start=series.index[1], end=series.index[-1], dynamic=False)
+    pred_mean = sarima_model.fittedvalues
+    actual = series[pred_mean.index]
 
     rmse_train = np.sqrt(mean_squared_error(series, pred_mean))
     mae_train = mean_absolute_error(series, pred_mean)
@@ -276,15 +291,31 @@ def top_correlated(request: CorrelationRequest):
     df = get_excel_file_from_s3(folder_name, file_name)
     if 'DESCRIPCION' not in df.columns:
         raise HTTPException(status_code=400, detail="La columna 'DESCRIPCION' no se encontró en los datos.")
-    df.set_index('DESCRIPCION', inplace=True)
-    df = clean_and_convert_columns(df)
-    if description not in df.index:
+
+    # Seleccionar la columna DESCRIPCION y todas las columnas a su derecha
+    columns_after_description = df.columns[df.columns.get_loc('DESCRIPCION') + 1:]
+    df_filtered = df[['DESCRIPCION'] + list(columns_after_description)]
+
+    # Agrupar por DESCRIPCION para asegurarnos que cada medicamento aparezca una única vez.
+    # Puedes elegir 'first' o 'mean', según convenga.
+    df_filtered = df_filtered.groupby('DESCRIPCION').first().reset_index()
+
+    # Establecer DESCRIPCION como índice y limpiar datos
+    df_filtered.set_index('DESCRIPCION', inplace=True)
+    df_filtered = clean_and_convert_columns(df_filtered)
+
+    if description not in df_filtered.index:
         raise HTTPException(status_code=404, detail="Descripción no encontrada en los datos.")
-    df_transposed = df.transpose()
+
+    # Transponer para que cada fila (fecha/histórico) sea una observación y cada medicamento una variable
+    df_transposed = df_filtered.transpose()
     corr_matrix = df_transposed.corr()
+
     if description not in corr_matrix.columns:
         raise HTTPException(status_code=404, detail="Descripción no encontrada en la matriz de correlación.")
+
     top_medications = get_top_correlated_medications(description, corr_matrix, top_n)
+
     return {
         "description": description,
         "top_correlated_medications": top_medications
