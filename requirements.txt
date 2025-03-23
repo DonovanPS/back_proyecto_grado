@@ -8,4 +8,4 @@ uvicorn
 openpyxl
 numpy==1.24.4
 scikit-learn
-BayesianOptimization
+bayesian-optimization
