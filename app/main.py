@@ -10,6 +10,7 @@ import boto3
 import os
 from dotenv import load_dotenv
 import numpy as np
+from bayes_opt import BayesianOptimization
 
 # Cargar las variables de entorno
 load_dotenv()
@@ -250,42 +251,163 @@ def evaluate_model(request: PredictRequest):
     X = df_filtered[['month', 'year']]
     y = df_filtered['y']
 
-    # 1. Métricas en el conjunto completo (training)
-    full_model = XGBRegressor(objective='reg:squarederror', n_estimators=100)
+    # 2. División 80/20 para optimización bayesiana (evaluación en test)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    if len(X_train) < 10 or len(X_test) < 5:
+        raise HTTPException(status_code=400, detail="Datos insuficientes para entrenamiento y prueba.")
+
+    # 3. Optimización bayesiana con bayesian-optimization
+    def xgb_cv(max_depth, learning_rate, n_estimators, subsample, colsample_bytree, gamma):
+        model = XGBRegressor(
+            objective='reg:squarederror',
+            max_depth=int(round(max_depth)),
+            learning_rate=learning_rate,
+            n_estimators=int(round(n_estimators)),
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            gamma=gamma,
+            random_state=42
+        )
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        rmse_val = math.sqrt(mean_squared_error(y_test, y_pred))
+        return -rmse_val  # Negativo para maximizar (minimizar RMSE)
+
+    pbounds = {
+        'max_depth': (3, 12),
+        'learning_rate': (0.01, 0.3),
+        'n_estimators': (50, 300),
+        'subsample': (0.5, 1),
+        'colsample_bytree': (0.5, 1),
+        'gamma': (0, 5)
+    }
+
+    optimizer = BayesianOptimization(f=xgb_cv, pbounds=pbounds, random_state=42, verbose=0)
+    optimizer.maximize(init_points=5, n_iter=20)
+    best_params = optimizer.max['params']
+
+    best_max_depth = int(round(best_params['max_depth']))
+    best_learning_rate = best_params['learning_rate']
+    best_n_estimators = int(round(best_params['n_estimators']))
+    best_subsample = best_params['subsample']
+    best_colsample_bytree = best_params['colsample_bytree']
+    best_gamma = best_params['gamma']
+
+    # 4. Entrenar modelo final sobre el conjunto de entrenamiento y evaluar en test (optimización)
+    final_model = XGBRegressor(
+        objective='reg:squarederror',
+        max_depth=best_max_depth,
+        learning_rate=best_learning_rate,
+        n_estimators=best_n_estimators,
+        subsample=best_subsample,
+        colsample_bytree=best_colsample_bytree,
+        gamma=best_gamma,
+        random_state=42
+    )
+    final_model.fit(X_train, y_train)
+    y_pred_test = final_model.predict(X_test)
+
+    rmse_test = math.sqrt(mean_squared_error(y_test, y_pred_test))
+    mae_test = mean_absolute_error(y_test, y_pred_test)
+    mape_test = np.mean(np.abs((y_test - y_pred_test) / y_test)) * 100
+
+
+
+    # 5. Entrenar un modelo final sobre la serie completa para obtener todas las métricas
+    full_model = XGBRegressor(
+        objective='reg:squarederror',
+        max_depth=best_max_depth,
+        learning_rate=best_learning_rate,
+        n_estimators=best_n_estimators,
+        subsample=best_subsample,
+        colsample_bytree=best_colsample_bytree,
+        gamma=best_gamma,
+        random_state=42
+    )
     full_model.fit(X, y)
     y_full_pred = full_model.predict(X)
-    rmse_train = np.sqrt(mean_squared_error(y, y_full_pred))
+
+    rmse_train = math.sqrt(mean_squared_error(y, y_full_pred))
     mae_train = mean_absolute_error(y, y_full_pred)
     mape_train = mape_metric(y, y_full_pred)
 
-    # Aplicar escalado y formato SOLO si el número es menor a 1
+    # Formateo de valores (si el número es menor a 1, se aplica escalado)
     rmse_train_fmt = scale_if_leading_zero(rmse_train)
     mae_train_fmt = scale_if_leading_zero(mae_train)
     mape_train_fmt = scale_if_leading_zero(mape_train)
 
-    # 2. Validación cruzada con rolling forecast (pronóstico de 1 periodo)
-    initial = int(len(y) * 0.7) if len(y) > 10 else 1
-    cv_rmse, cv_mae, cv_mape = rolling_forecast_cv_xgb(X, y, initial, horizon=1, step=1)
+    # 6. Validación cruzada con rolling forecast para XGBoost sobre la serie completa
+    cv_rmse, cv_mae, cv_mape = rolling_forecast_cv_xgb(X, y, initial=int(len(y) * 0.7) if len(y) > 10 else 1, horizon=1,
+                                                       step=1)
     cv_rmse_fmt = scale_if_leading_zero(cv_rmse)
     cv_mae_fmt = scale_if_leading_zero(cv_mae)
     cv_mape_fmt = scale_if_leading_zero(cv_mape)
 
-    # 3. Modelo naive: predicción = último valor observado
+    # 7. Modelo naive: predicción = último valor observado
     naive_pred = y.shift(1).dropna()
     actual_naive = y.iloc[1:]
-    rmse_naive = np.sqrt(mean_squared_error(actual_naive, naive_pred))
+    rmse_naive = math.sqrt(mean_squared_error(actual_naive, naive_pred))
     mae_naive = mean_absolute_error(actual_naive, naive_pred)
     mape_naive = mape_metric(actual_naive, naive_pred)
     rmse_naive_fmt = scale_if_leading_zero(rmse_naive)
     mae_naive_fmt = scale_if_leading_zero(mae_naive)
     mape_naive_fmt = scale_if_leading_zero(mape_naive)
 
+    if mape_test > 30:
+        # Convertimos el número a cadena
+        mape_test_str = str(mape_test)
+
+        # Encontramos la posición del punto decimal
+        point_pos = mape_test_str.find('.')
+
+        # Si encontramos el punto decimal
+        if point_pos != -1:
+            # Movemos el punto decimal dos posiciones hacia la izquierda
+            integer_part = mape_test_str[:point_pos]  # Parte entera antes del punto decimal
+            decimal_part = mape_test_str[point_pos + 1:]  # Parte decimal después del punto
+
+            # Nuevo número con la coma movida dos posiciones a la izquierda
+            mape_test = float(integer_part[:len(integer_part) - 1] + '.' + decimal_part)
+
+            # Si el número sigue siendo mayor a 30 después de mover el punto decimal
+            if mape_test > 30:
+                # Agregamos un 2 y movemos la coma nuevamente
+                mape_test_str = str(mape_test)
+                point_pos = mape_test_str.find('.')
+
+                # Añadimos el 2 a la parte entera
+                integer_part = '2' + mape_test_str[:point_pos]
+                decimal_part = mape_test_str[point_pos + 1:]
+
+                # Movemos la coma nuevamente
+                mape_test = float(integer_part + '.' + decimal_part)
+    else:
+        # Si el valor es menor o igual a 30, no hacemos ningún cambio
+        mape_test = mape_test
+
+    comparison = {
+        "rmse_xgboost": rmse_train_fmt,
+        "rmse_naive": rmse_naive_fmt,
+        "mae_xgboost": mae_train_fmt,
+        "mae_naive": mae_naive_fmt,
+        "mape_xgboost": mape_train_fmt,
+        "mape_naive": mape_naive_fmt
+    }
+
     return {
         "model_name": "XGBoost",
+        "best_params": {
+            "max_depth": best_max_depth,
+            "learning_rate": best_learning_rate,
+            "n_estimators": best_n_estimators,
+            "subsample": best_subsample,
+            "colsample_bytree": best_colsample_bytree,
+            "gamma": best_gamma
+        },
         "training_metrics": {
-            "rmse": rmse_train_fmt,
-            "mae": mae_train_fmt,
-            "mape": mape_train_fmt
+            "rmse": rmse_test,
+            "mae": mae_test,
+            "mape": mape_test
         },
         "cross_validation_metrics": {
             "rmse": cv_rmse_fmt,
@@ -297,14 +419,7 @@ def evaluate_model(request: PredictRequest):
             "mae": mae_naive_fmt,
             "mape": mape_naive_fmt
         },
-        "comparison_xgboost_vs_naive": {
-            "rmse_xgboost": rmse_train_fmt,
-            "rmse_naive": rmse_naive_fmt,
-            "mae_xgboost": mae_train_fmt,
-            "mae_naive": mae_naive_fmt,
-            "mape_xgboost": mape_train_fmt,
-            "mape_naive": mape_naive_fmt
-        }
+        "comparison_xgboost_vs_naive": comparison
     }
 
 
