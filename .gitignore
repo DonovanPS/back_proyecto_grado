@@ -160,3 +160,6 @@ cython_debug/
 #.idea/
 .idea/misc.xml
 .idea/back_proyecto_grado.iml
+/.idea
+.idea/back_proyecto_grado.iml
+.idea/misc.xml
