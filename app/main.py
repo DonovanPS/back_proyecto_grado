@@ -10,10 +10,11 @@ from dotenv import load_dotenv
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import numpy as np
 from math import sqrt
-
+import warnings
 from bayes_opt import BayesianOptimization
+import concurrent.futures  # Para usar hilos
 
-
+warnings.filterwarnings("ignore")
 load_dotenv()
 
 # Configuración del cliente S3
@@ -26,7 +27,6 @@ s3_client = boto3.client(
 bucket_name = os.getenv('AWS_BUCKET_NAME')
 
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,7 +35,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # Modelos de request
 class PredictRequest(BaseModel):
     folder_name: str
@@ -43,13 +42,11 @@ class PredictRequest(BaseModel):
     file_name: str
     periods: int  # Número de meses a predecir
 
-
 class CorrelationRequest(BaseModel):
     folder_name: str
     description: str
     file_name: str
     top_n: int = 5  # Número de medicamentos a retornar, por defecto 5
-
 
 def get_excel_file_from_s3(folder_name: str, file_name: str) -> pd.DataFrame:
     """Descargar y leer un archivo Excel desde S3."""
@@ -58,11 +55,9 @@ def get_excel_file_from_s3(folder_name: str, file_name: str) -> pd.DataFrame:
         response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
         file_content = response['Body'].read()
         df = pd.read_excel(BytesIO(file_content))
-
         return df
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 def clean_and_convert_columns(df):
     numeric_columns = df.columns
@@ -74,7 +69,6 @@ def clean_and_convert_columns(df):
     df.dropna(how='all', inplace=True)
     return df
 
-
 def mape_metric(y_true, y_pred):
     """Calcula el MAPE evitando división por cero."""
     y_true, y_pred = np.array(y_true), np.array(y_pred)
@@ -85,8 +79,29 @@ def mape_metric(y_true, y_pred):
         return np.nan
     return np.mean(np.abs((y_true_nz - y_pred_nz) / y_true_nz)) * 100
 
+# Función que realiza el ajuste y evaluación del modelo (la parte “pesada”)
+def sarimax_cv_impl(p, d, q, P, D, Q, train, test):
+    p, d, q = int(round(p)), int(round(d)), int(round(q))
+    P, D, Q = int(round(P)), int(round(D)), int(round(Q))
+    try:
+        model = SARIMAX(train["y"],
+                        order=(p, d, q),
+                        seasonal_order=(P, D, Q, 12),
+                        enforce_stationarity=False,
+                        enforce_invertibility=False)
+        model_fit = model.fit(disp=False)
+        preds = model_fit.predict(start=test.index[0], end=test.index[-1], dynamic=False)
+        rmse_val = sqrt(mean_squared_error(test["y"], preds))
+        return -rmse_val  # Se retorna negativo para la optimización
+    except Exception:
+        return -1e6
 
-# --- Endpoint /predict modificado para optimización bayesiana ---
+# Función que usa un executor para correr la evaluación en un hilo
+def sarimax_cv_parallel(p, d, q, P, D, Q, train, test, executor):
+    future = executor.submit(sarimax_cv_impl, p, d, q, P, D, Q, train, test)
+    return future.result()
+
+# --- Endpoint /predict modificado para optimización bayesiana con hilos ---
 @app.post("/predict")
 def predict(request: PredictRequest):
     folder_name = request.folder_name
@@ -102,7 +117,6 @@ def predict(request: PredictRequest):
     # Se toma la columna DESCRIPCION y las que le siguen
     col_index = df.columns.get_loc("DESCRIPCION")
     df = df.iloc[:, col_index:]
-
     df = df.drop_duplicates(subset=["DESCRIPCION"], keep="first")
 
     # Convertir a formato largo
@@ -133,23 +147,6 @@ def predict(request: PredictRequest):
     if len(train) < 10 or len(test) < 5:
         raise HTTPException(status_code=400, detail="Datos insuficientes para entrenamiento y prueba.")
 
-    # Función objetivo para optimización bayesiana (se retorna negativo RMSE)
-    def sarimax_cv(p, d, q, P, D, Q):
-        p, d, q = int(round(p)), int(round(d)), int(round(q))
-        P, D, Q = int(round(P)), int(round(D)), int(round(Q))
-        try:
-            model = SARIMAX(train["y"],
-                            order=(p, d, q),
-                            seasonal_order=(P, D, Q, 12),
-                            enforce_stationarity=False,
-                            enforce_invertibility=False)
-            model_fit = model.fit(disp=False)
-            preds = model_fit.predict(start=test.index[0], end=test.index[-1], dynamic=False)
-            rmse_val = sqrt(mean_squared_error(test["y"], preds))
-            return -rmse_val
-        except Exception:
-            return -1e6
-
     pbounds = {
         'p': (0, 3),
         'd': (0, 1),
@@ -159,14 +156,18 @@ def predict(request: PredictRequest):
         'Q': (0, 2)
     }
 
-    optimizer = BayesianOptimization(
-        f=sarimax_cv,
-        pbounds=pbounds,
-        random_state=42,
-        verbose=0
-    )
-    optimizer.maximize(init_points=5, n_iter=15)
-    best = optimizer.max['params']
+    # Usamos un ThreadPoolExecutor para paralelizar las evaluaciones
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        optimizer = BayesianOptimization(
+            # Se usa una función lambda que cierra sobre train, test y executor
+            f=lambda p, d, q, P, D, Q: sarimax_cv_parallel(p, d, q, P, D, Q, train, test, executor),
+            pbounds=pbounds,
+            random_state=42,
+            verbose=0
+        )
+        optimizer.maximize(init_points=5, n_iter=15)
+        best = optimizer.max['params']
+
     best_p = int(round(best['p']))
     best_d = int(round(best['d']))
     best_q = int(round(best['q']))
@@ -188,31 +189,25 @@ def predict(request: PredictRequest):
     preds_final = final_fit.predict(start=test.index[0], end=test.index[-1], dynamic=False)
     rmse_test = sqrt(mean_squared_error(test["y"], preds_final))
     mae_test = mean_absolute_error(test["y"], preds_final)
-    mape_test = mape(test["y"], preds_final)
+    mape_test = mape_metric(test["y"], preds_final)
 
     # Pronosticar periodos futuros utilizando get_forecast
-    # Se generan fechas con frecuencia 'MS' para obtener el primer día del mes
     last_date = df_medi.index.max()
     future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=periods, freq='MS')
     future_preds = final_fit.get_forecast(steps=periods)
     forecast = future_preds.predicted_mean
 
     historical_data = df_medi.reset_index().rename(columns={"ds": "ds", "y": "y"}).to_dict(orient="records")
-    predictions = [{"ds": date, "yhat": pred} for date, pred in zip(future_dates, forecast)]
+    predictions = [{"ds": str(date.date()), "yhat": pred} for date, pred in zip(future_dates, forecast)]
 
     print("---------------------------------------------------")
-
     print("Historical Data:")
     print(historical_data)
-
     print("\nPredictions:")
     print(predictions)
-
     print("\nModel: SARIMAX")
-
     print(f"Best Order: (p={best_p}, d={best_d}, q={best_q})")
     print(f"Best Seasonal Order: (P={best_P}, D={best_D}, Q={best_Q}, 12)")
-
     print("\nTest Metrics:")
     print(f"  RMSE: {rmse_test}")
     print(f"  MAE: {mae_test}")
@@ -230,6 +225,7 @@ def predict(request: PredictRequest):
             "mape": mape_test
         }
     }
+
 
 
 def mape(y_true, y_pred):
