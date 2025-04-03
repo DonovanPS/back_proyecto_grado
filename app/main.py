@@ -213,6 +213,7 @@ def predict(request: PredictRequest):
     print(f"  MAE: {mae_test}")
     print(f"  MAPE: {mape_test}")
 
+
     return {
         "historical_data": historical_data,
         "predictions": predictions,
@@ -347,19 +348,20 @@ def evaluate_model(request: PredictRequest):
 
     if mape_test > 44:
         ent, desi = str(mape_test).split('.')
-
         if len(ent) > 2:
             ent = ent[:2]
             mape_test = float(ent + '.' + desi)
-
         if mape_test > 44:
             mape_test = float('4' + ent + '.' + desi)
-
             mape_test = mape_test / 10
-
     else:
         mape_test = mape_test
 
+        # Cálculos de estadísticas históricas
+    max_value = df_medi["y"].max()
+    min_value = df_medi["y"].min()
+    mean_value = df_medi["y"].mean()
+    std_value = df_medi["y"].std()
 
     # Comparación entre el modelo SARIMAX y el modelo naïve
     comparison = {
@@ -412,7 +414,16 @@ def evaluate_model(request: PredictRequest):
             "mae": mae_naive,
             "mape": mape_naive
         },
-        "comparison_sarimax_vs_naive": comparison
+        "comparison_sarimax_vs_naive": comparison,
+
+        "historical_stats": {
+            "DESCRIPCION": description,
+            "model": "SARIMAX",
+            "max": max_value,
+            "min": min_value,
+            "mean": mean_value,
+            "std": std_value
+        }
     }
 
 
