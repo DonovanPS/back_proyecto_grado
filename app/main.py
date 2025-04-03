@@ -200,6 +200,24 @@ def predict(request: PredictRequest):
     historical_data = df_medi.reset_index().rename(columns={"ds": "ds", "y": "y"}).to_dict(orient="records")
     predictions = [{"ds": date, "yhat": pred} for date, pred in zip(future_dates, forecast)]
 
+    print("---------------------------------------------------")
+
+    print("Historical Data:")
+    print(historical_data)
+
+    print("\nPredictions:")
+    print(predictions)
+
+    print("\nModel: SARIMAX")
+
+    print(f"Best Order: (p={best_p}, d={best_d}, q={best_q})")
+    print(f"Best Seasonal Order: (P={best_P}, D={best_D}, Q={best_Q}, 12)")
+
+    print("\nTest Metrics:")
+    print(f"  RMSE: {rmse_test}")
+    print(f"  MAE: {mae_test}")
+    print(f"  MAPE: {mape_test}")
+
     return {
         "historical_data": historical_data,
         "predictions": predictions,
@@ -571,6 +589,28 @@ def evaluate_model(request: PredictRequest):
         "sarimax_mape": mape_test,
         "naive_mape": mape_naive
     }
+
+    print("Model Name: SARIMAX VC")
+    print(f"Best Order: (p={best_p}, d={best_d}, q={best_q})")
+    print(f"Best Seasonal Order: (P={best_P}, D={best_D}, Q={best_Q}, 12)")
+
+    print("\nTraining Metrics:")
+    print(f"  RMSE: {rmse_test}")
+    print(f"  MAE: {mae_test}")
+    print(f"  MAPE: {mape_test}")
+
+    print("\nCross Validation Metrics:")
+    print(f"  RMSE: {rmse_test}")
+    print(f"  MAE: {mae_test}")
+    print(f"  MAPE: {mape_test}")
+
+    print("\nNaive Model Metrics:")
+    print(f"  RMSE: {rmse_naive}")
+    print(f"  MAE: {mae_naive}")
+    print(f"  MAPE: {mape_naive}")
+
+    print("\nComparison SARIMAX vs Naive:")
+    print(comparison)
 
     return {
         "model_name": "SARIMAX VC",
