@@ -353,16 +353,17 @@ def evaluate_model(request: PredictRequest):
     mae_naive_fmt = scale_if_leading_zero(mae_naive)
     mape_naive_fmt = scale_if_leading_zero(mape_naive)
 
+    # Cálculos de estadísticas históricas
+    max_value = df_filtered["y"].max()
+    min_value = df_filtered["y"].min()
+    mean_value = df_filtered["y"].mean()
+    std_value = df_filtered["y"].std()
+
     if mape_test > 30:
-        # Convertimos el número a cadena
+
         mape_test_str = str(mape_test)
-
-        # Encontramos la posición del punto decimal
         point_pos = mape_test_str.find('.')
-
-        # Si encontramos el punto decimal
         if point_pos != -1:
-            # Movemos el punto decimal dos posiciones hacia la izquierda
             integer_part = mape_test_str[:point_pos]  # Parte entera antes del punto decimal
             decimal_part = mape_test_str[point_pos + 1:]  # Parte decimal después del punto
 
@@ -419,7 +420,16 @@ def evaluate_model(request: PredictRequest):
             "mae": mae_naive_fmt,
             "mape": mape_naive_fmt
         },
-        "comparison_xgboost_vs_naive": comparison
+        "comparison_xgboost_vs_naive": comparison,
+
+        "historical_stats": {
+            "DESCRIPCION": description,
+            "model": "XGBoost",
+            "max": max_value,
+            "min": min_value,
+            "mean": mean_value,
+            "std": std_value
+        }
     }
 
 
