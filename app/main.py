@@ -295,13 +295,19 @@ def evaluate_model(request: PredictRequest):
     naive_mae = mean_absolute_error(real_values_naive, naive_predictions)
     naive_mape = mape_metric(real_values_naive, naive_predictions)
 
+      # Cálculos de estadísticas históricas
+    max_value = df_filtered["y"].max()
+    min_value = df_filtered["y"].min()
+    mean_value = df_filtered["y"].mean()
+    std_value = df_filtered["y"].std()
+
     return {
         "model_name": "Prophet (Optimized)",
         "best_hyperparameters": {"cps": hyperparams["best_cps"], "sps": hyperparams["best_sps"]},
         "training_metrics": {
-            "rmse": rmse_train,
-            "mae": mae_train,
-            "mape": mape_train
+            "rmse": cv_rmse,
+            "mae": cv_mae,
+            "mape": cv_mape
         },
         "cross_validation_metrics": {
             "rmse": cv_rmse,
@@ -320,7 +326,18 @@ def evaluate_model(request: PredictRequest):
             "naive_mae": naive_mae,
             "mape_prophet": mape_train,
             "naive_mape": naive_mape
+        },
+
+        "historical_stats": {
+            "DESCRIPCION": description,
+            "model": "Prophet",
+            "max": max_value,
+            "min": min_value,
+            "mean": mean_value,
+            "std": std_value
         }
+
+
     }
 
 
